@@ -34,7 +34,6 @@ type ClientPeer struct {
 	rxReliable  *reliable.ReliableReceiver
 	txReliable  *reliable.ReliableSender
 	joined      bool
-	lastInput   uint32
 	lastActive  time.Time // 最后活跃时间，用于超时检测
 	inputCount  int       // 输入计数（用于限流）
 	inputWindow time.Time // 输入窗口开始时间
@@ -120,7 +119,6 @@ func (s *Server) registerPeer(id int, addr *net.UDPAddr) *ClientPeer {
 		rxReliable:  reliable.NewReliableReceiver(),
 		txReliable:  reliable.NewReliableSender(),
 		joined:      false,
-		lastInput:   0,
 		lastActive:  time.Now(),
 		inputWindow: time.Now(),
 	}
@@ -156,7 +154,6 @@ func (s *Server) storeInput(tick uint32, pid uint16, input uint32) {
 
 	s.room.mu.Lock()
 	if peer, ok := s.room.players[int(pid)]; ok {
-		peer.lastInput = input
 		peer.lastActive = time.Now()
 
 		// 限流检测
@@ -284,7 +281,7 @@ func (s *Server) ListenLoop() {
 	}
 }
 
-// BroadcastLoop 按 tick 广播 Frame，并用 lastInput 补全缺失
+// BroadcastLoop 按 tick 广播 Frame，缺失输入使用 InputNone (0) 补全
 func (s *Server) BroadcastLoop() {
 	ticker := time.NewTicker(time.Duration(1000/s.tickHz) * time.Millisecond)
 	for range ticker.C {
@@ -300,10 +297,12 @@ func (s *Server) BroadcastLoop() {
 			s.inputs[s.tick] = make(map[uint16]uint32)
 		}
 		s.room.mu.Lock()
-		for pid, peer := range s.room.players {
+		for pid := range s.room.players {
 			pid16 := uint16(pid)
 			if _, ok := s.inputs[s.tick][pid16]; !ok {
-				s.inputs[s.tick][pid16] = peer.lastInput
+				// 如果玩家没有输入，使用 InputNone (0) 而不是 lastInput
+				// 这样玩家会保持不动，而不是继续按上次的方向移动
+				s.inputs[s.tick][pid16] = 0 // InputNone
 			}
 		}
 		s.room.mu.Unlock()
