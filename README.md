@@ -8,7 +8,8 @@ Lightweight Lockstep Game Framework (Go)
 - 核心特性
 - 架构概览
 - 目录结构
-- 快速开始
+- 快速开始（测试）
+- Go SDK 接入
 - 已具备能力
 - 后续规划
 
@@ -39,24 +40,36 @@ Lightweight Lockstep Game Framework (Go)
 - `game/`：示例游戏逻辑与 Tick 驱动。
 
 ## 快速开始（测试验证）
-1) 启动服务器（默认 20Hz，可用 `--hz 60` 提升帧率）
+1) 启动服务器（默认 20Hz，可用 `--hz 60` 提升帧率）  
 ```
 go run ./cmd/server
 ```
-2) 启动测试客户端（示例开启两个客户端）
+2) 启动测试客户端（仅用于验证网络/帧同步）  
 ```
 go run ./cmd/testclient --id 1
 go run ./cmd/testclient --id 2
 ```
-3) 观察
-- 客户端本地预测移动，服务器 authoritative 帧下发后校正。
-- RTT 变化时，inputDelay 会自动调整以保持同步。
+3) 观察  
+- 客户端本地预测移动，服务器 authoritative 帧下发后校正  
+- RTT 变化时，inputDelay 自动调整  
 
 > 说明：测试客户端仅用于验证协议和帧同步流程；实际游戏前端请用 Unity/Cocos 等接入本框架的网络与协议层。
 
 ## Go SDK 接入
-- 文档：详见 `docs/INTEGRATION.md`，包含协议格式、可靠层用法、服务器骨架与可配置项。
-- 使用方式：通过 Go module 依赖本仓库，建议依赖发布的 tag/release，避免直接修改核心源码。
+- 文档：详见 `docs/INTEGRATION.md`（公共 API、协议/可靠层、服务器骨架与配置）。
+- 依赖：在你的 go.mod 中引用发布的 tag/release（避免改核心源码）。
+- 服务器最小示例：
+  ```go
+  import "gameframework/pkg/server"
+
+  func main() {
+      srv, _ := server.NewServer(":30000", 60)
+      go srv.ListenLoop()
+      go srv.ReliableRetransmitLoop()
+      srv.BroadcastLoop()
+  }
+  ```
+- 客户端（任意语言/引擎）：按 `pkg/proto` 的 InputPacket/FramePacket 格式发送输入、解析帧；可靠控制消息用 `reliable` 流程（AddPending/BuildAckAndBits/ProcessAck）。
 
 ## 使用建议（作为底层网络框架）
 - 作为依赖使用：将本仓库作为 Go module 依赖，按协议接入，不建议改动核心源码。
