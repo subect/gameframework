@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"gameframework/pkg/game"
 	"gameframework/pkg/proto"
 	"gameframework/pkg/reliable"
 	"net"
@@ -31,8 +32,9 @@ type Server struct {
 	inputs   map[uint32]map[uint16]uint32
 	inputsMu sync.Mutex
 
-	tick   uint32
-	tickHz int
+	tick      uint32
+	tickHz    int
+	gameState *game.GameState
 }
 
 // NewServer 创建并绑定 UDP
@@ -46,9 +48,10 @@ func NewServer(listen string, tickHz int) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		conn:   conn,
-		inputs: make(map[uint32]map[uint16]uint32),
-		tickHz: tickHz,
+		conn:      conn,
+		inputs:    make(map[uint32]map[uint16]uint32),
+		tickHz:    tickHz,
+		gameState: game.NewGameState(),
 	}
 	s.room.players = make(map[int]*ClientPeer)
 	return s, nil
@@ -237,18 +240,36 @@ func (s *Server) BroadcastLoop() {
 			s.inputs[s.tick] = make(map[uint16]uint32)
 		}
 		s.room.mu.Lock()
-		for pid, peer := range s.room.players {
+		for pid := range s.room.players {
 			pid16 := uint16(pid)
 			if _, ok := s.inputs[s.tick][pid16]; !ok {
-				s.inputs[s.tick][pid16] = peer.lastInput
+				// 如果没有收到输入，使用InputNone而不是lastInput
+				// 这样可以避免持续移动
+				s.inputs[s.tick][pid16] = 0 // InputNone
 			}
 		}
 		s.room.mu.Unlock()
 		inputs := s.inputs[s.tick]
 		s.inputsMu.Unlock()
 
+		// 应用输入到游戏状态
+		for pid, input := range inputs {
+			s.gameState.ApplyInput(pid, input)
+		}
+
+		// 构建帧数据，包含输入和位置
 		payloadBuf := &bytes.Buffer{}
 		proto.WriteFramePacket(payloadBuf, s.tick, inputs)
+
+		// 添加所有玩家位置
+		allPos := s.gameState.GetAllPositions()
+		binary.Write(payloadBuf, binary.LittleEndian, uint8(len(allPos)))
+		for pid, pos := range allPos {
+			binary.Write(payloadBuf, binary.LittleEndian, pid)
+			binary.Write(payloadBuf, binary.LittleEndian, pos.X)
+			binary.Write(payloadBuf, binary.LittleEndian, pos.Y)
+		}
+
 		payload := payloadBuf.Bytes()
 
 		s.room.mu.Lock()
@@ -303,6 +324,8 @@ func (s *Server) HandleJoinReliable(peer *ClientPeer, reliableSeq uint32, inner 
 		return
 	}
 	peer.joined = true
+	// 初始化玩家位置
+	s.gameState.ApplyInput(uint16(peer.id), game.InputNone)
 	ackPayload := []byte{proto.MsgJoinAck, byte(peer.id)}
 	seq := peer.txReliable.AddPending(ackPayload)
 	ack, ackbits := peer.rxReliable.BuildAckAndBits()

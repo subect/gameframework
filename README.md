@@ -30,27 +30,40 @@ Lightweight Lockstep Game Framework (Go)
   - UDP + 自定义可靠层，分离可靠与不可靠消息，降低时延同时确保关键状态一致。
 
 ## 目录结构
-- `cmd/server`：示例服务器入口。
-- `cmd/client`：示例客户端入口。
+- `cmd/server`：示例服务器入口（帧同步核心）。
+- `cmd/testclient`：**测试用文本客户端**（仅用于验证网络/帧同步，生产请自研前端）。
 - `reliable/`：可靠 UDP 协议实现。
 - `protocol/`：消息协议与封包定义。
 - `server/`：房间、玩家管理与帧同步逻辑。
-- `client/`：客户端帧同步与预测逻辑。
+- `client/`：客户端帧同步与预测逻辑（供参考接入，可替换）。
 - `game/`：示例游戏逻辑与 Tick 驱动。
 
-## 快速开始
-1) 启动服务器
+## 快速开始（测试验证）
+1) 启动服务器（默认 20Hz，可用 `--hz 60` 提升帧率）
 ```
 go run ./cmd/server
 ```
-2) 启动客户端（示例开启两个客户端）
+2) 启动测试客户端（示例开启两个客户端）
 ```
-go run ./cmd/client --id 1
-go run ./cmd/client --id 2
+go run ./cmd/testclient --id 1
+go run ./cmd/testclient --id 2
 ```
 3) 观察
 - 客户端本地预测移动，服务器 authoritative 帧下发后校正。
 - RTT 变化时，inputDelay 会自动调整以保持同步。
+
+> 说明：测试客户端仅用于验证协议和帧同步流程；实际游戏前端请用 Unity/Cocos 等接入本框架的网络与协议层。
+
+## Go SDK 接入
+- 文档：详见 `docs/INTEGRATION.md`，包含协议格式、可靠层用法、服务器骨架与可配置项。
+- 使用方式：通过 Go module 依赖本仓库，建议依赖发布的 tag/release，避免直接修改核心源码。
+
+## 使用建议（作为底层网络框架）
+- 作为依赖使用：将本仓库作为 Go module 依赖，按协议接入，不建议改动核心源码。
+- 配置优先：端口、tick 频率、速度等通过启动参数或配置调整，避免直接修改核心逻辑。
+- 稳定版本：建议依赖发布的 tag/release，而非 main 开发分支。
+- 贡献方式：如需改动核心，请先提 Issue/PR 讨论；保护核心代码路径（`pkg/reliable/`, `pkg/proto/`, `pkg/server/`, `pkg/game/`），避免直接修改。
+- 前端接入：Unity/Cocos 等客户端建议仅复用协议与网络层，测试客户端仅作参考。
 
 ## 已具备能力
 - 多玩家移动同步与帧广播。

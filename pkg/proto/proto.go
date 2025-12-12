@@ -86,6 +86,58 @@ func ReadFramePacket(b []byte) (uint32, map[uint16]uint32, error) {
 	return tick, inputs, nil
 }
 
+// PlayerPos 玩家位置
+type PlayerPos struct {
+	PID  uint16
+	X, Y float32
+}
+
+// ReadFramePacketWithPos 读取包含位置的帧数据
+func ReadFramePacketWithPos(b []byte) (uint32, map[uint16]uint32, []PlayerPos, error) {
+	tick, inputs, err := ReadFramePacket(b)
+	if err != nil {
+		return tick, inputs, nil, err
+	}
+
+	// 尝试读取位置数据
+	r := bytes.NewReader(b)
+	// 跳过已读的数据
+	var tempTick uint32
+	var tempCount uint8
+	binary.Read(r, binary.LittleEndian, &tempTick)
+	binary.Read(r, binary.LittleEndian, &tempCount)
+	for i := 0; i < int(tempCount); i++ {
+		var pid uint16
+		var in uint32
+		binary.Read(r, binary.LittleEndian, &pid)
+		binary.Read(r, binary.LittleEndian, &in)
+	}
+
+	// 读取位置
+	var posCount uint8
+	if err := binary.Read(r, binary.LittleEndian, &posCount); err != nil {
+		// 没有位置数据，返回空
+		return tick, inputs, nil, nil
+	}
+
+	positions := make([]PlayerPos, 0, posCount)
+	for i := 0; i < int(posCount); i++ {
+		var pos PlayerPos
+		if err := binary.Read(r, binary.LittleEndian, &pos.PID); err != nil {
+			return tick, inputs, positions, err
+		}
+		if err := binary.Read(r, binary.LittleEndian, &pos.X); err != nil {
+			return tick, inputs, positions, err
+		}
+		if err := binary.Read(r, binary.LittleEndian, &pos.Y); err != nil {
+			return tick, inputs, positions, err
+		}
+		positions = append(positions, pos)
+	}
+
+	return tick, inputs, positions, nil
+}
+
 // UDP header: packetSeq:uint32 | ack:uint32 | ackBits:uint32 | payload...
 func WriteUDPHeader(buf *bytes.Buffer, packetSeq, ack, ackBits uint32) {
 	binary.Write(buf, binary.LittleEndian, packetSeq)
