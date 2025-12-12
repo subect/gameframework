@@ -29,28 +29,39 @@ type GameLogic interface {
 
 // ClientPeer 保留 peer 状态
 type ClientPeer struct {
-	id         int
-	addr       *net.UDPAddr
-	rxReliable *reliable.ReliableReceiver
-	txReliable *reliable.ReliableSender
-	joined     bool
-	lastInput  uint32
+	id          int
+	addr        *net.UDPAddr
+	rxReliable  *reliable.ReliableReceiver
+	txReliable  *reliable.ReliableSender
+	joined      bool
+	lastInput   uint32
+	lastActive  time.Time // 最后活跃时间，用于超时检测
+	inputCount  int       // 输入计数（用于限流）
+	inputWindow time.Time // 输入窗口开始时间
 }
 
 // Server 主体（可插拔游戏逻辑）
 type Server struct {
 	conn *net.UDPConn
 	room struct {
-		players map[int]*ClientPeer
-		mu      sync.Mutex
+		players       map[int]*ClientPeer    // 按 ID 查找
+		playersByAddr map[string]*ClientPeer // 按地址查找（O(1)）
+		mu            sync.Mutex
 	}
 	inputs   map[uint32]map[uint16]uint32
 	inputsMu sync.Mutex
 
-	tick   uint32
-	tickHz int
+	tick            uint32
+	tickHz          int
+	maxReceivedTick uint32 // 维护最大接收 tick，避免每次遍历
+	maxTickMu       sync.Mutex
 
 	logic GameLogic
+
+	// 配置
+	playerTimeout  time.Duration // 玩家超时时间
+	maxInputPerSec int           // 每玩家每秒最大输入数
+	bufferPool     sync.Pool     // bytes.Buffer 复用池
 }
 
 // NewServer 创建并绑定 UDP，注入游戏逻辑。
@@ -67,12 +78,23 @@ func NewServer(listen string, tickHz int, logic GameLogic) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		conn:   conn,
-		inputs: make(map[uint32]map[uint16]uint32),
-		tickHz: tickHz,
-		logic:  logic,
+		conn:           conn,
+		inputs:         make(map[uint32]map[uint16]uint32),
+		tickHz:         tickHz,
+		logic:          logic,
+		playerTimeout:  30 * time.Second, // 默认 30 秒超时
+		maxInputPerSec: 100,              // 默认每秒最多 100 个输入
 	}
 	s.room.players = make(map[int]*ClientPeer)
+	s.room.playersByAddr = make(map[string]*ClientPeer)
+
+	// 初始化 buffer pool
+	s.bufferPool = sync.Pool{
+		New: func() interface{} {
+			return &bytes.Buffer{}
+		},
+	}
+
 	return s, nil
 }
 
@@ -80,19 +102,30 @@ func NewServer(listen string, tickHz int, logic GameLogic) (*Server, error) {
 func (s *Server) registerPeer(id int, addr *net.UDPAddr) *ClientPeer {
 	s.room.mu.Lock()
 	defer s.room.mu.Unlock()
+	addrKey := addr.String()
+
 	if p, ok := s.room.players[id]; ok {
+		// 更新地址映射
+		if p.addr != nil {
+			delete(s.room.playersByAddr, p.addr.String())
+		}
 		p.addr = addr
+		s.room.playersByAddr[addrKey] = p
+		p.lastActive = time.Now()
 		return p
 	}
 	p := &ClientPeer{
-		id:         id,
-		addr:       addr,
-		rxReliable: reliable.NewReliableReceiver(),
-		txReliable: reliable.NewReliableSender(),
-		joined:     false,
-		lastInput:  0,
+		id:          id,
+		addr:        addr,
+		rxReliable:  reliable.NewReliableReceiver(),
+		txReliable:  reliable.NewReliableSender(),
+		joined:      false,
+		lastInput:   0,
+		lastActive:  time.Now(),
+		inputWindow: time.Now(),
 	}
 	s.room.players[id] = p
+	s.room.playersByAddr[addrKey] = p
 	fmt.Printf("Server: registered peer id=%d addr=%s\n", id, addr.String())
 	return p
 }
@@ -100,12 +133,7 @@ func (s *Server) registerPeer(id int, addr *net.UDPAddr) *ClientPeer {
 func (s *Server) findPeerByAddr(addr *net.UDPAddr) *ClientPeer {
 	s.room.mu.Lock()
 	defer s.room.mu.Unlock()
-	for _, p := range s.room.players {
-		if p.addr != nil && p.addr.IP.Equal(addr.IP) && p.addr.Port == addr.Port {
-			return p
-		}
-	}
-	return nil
+	return s.room.playersByAddr[addr.String()]
 }
 
 func (s *Server) storeInput(tick uint32, pid uint16, input uint32) {
@@ -119,25 +147,38 @@ func (s *Server) storeInput(tick uint32, pid uint16, input uint32) {
 		s.inputs[tick] = make(map[uint16]uint32)
 	}
 	s.inputs[tick][pid] = input
+
+	// 更新最大接收 tick
+	if tick > s.maxReceivedTick {
+		s.maxReceivedTick = tick
+	}
 	s.inputsMu.Unlock()
 
 	s.room.mu.Lock()
 	if peer, ok := s.room.players[int(pid)]; ok {
 		peer.lastInput = input
+		peer.lastActive = time.Now()
+
+		// 限流检测
+		now := time.Now()
+		if now.Sub(peer.inputWindow) >= time.Second {
+			peer.inputCount = 0
+			peer.inputWindow = now
+		}
+		peer.inputCount++
+		if peer.inputCount > s.maxInputPerSec {
+			// 超过限制，丢弃输入
+			s.room.mu.Unlock()
+			return
+		}
 	}
 	s.room.mu.Unlock()
 }
 
 func (s *Server) findMaxReceivedTick() uint32 {
-	s.inputsMu.Lock()
-	defer s.inputsMu.Unlock()
-	var max uint32 = 0
-	for t := range s.inputs {
-		if t > max {
-			max = t
-		}
-	}
-	return max
+	s.maxTickMu.Lock()
+	defer s.maxTickMu.Unlock()
+	return s.maxReceivedTick
 }
 
 // ListenLoop 启动接收循环（建议以 goroutine 调用）
@@ -174,12 +215,16 @@ func (s *Server) ListenLoop() {
 			if p, err := proto.ReadInputPacket(payload); err == nil {
 				playerID := int(p.PlayerID)
 				peer = s.registerPeer(playerID, raddr)
+				peer.lastActive = time.Now() // 更新活跃时间
 				s.storeInput(p.Tick, p.PlayerID, p.Input)
 				s.logic.ApplyInput(p.PlayerID, p.Input)
 				continue
 			}
 			continue
 		}
+		// 更新活跃时间
+		peer.lastActive = time.Now()
+
 		// process ack for txReliable
 		if peer.txReliable != nil {
 			cleared := peer.txReliable.ProcessAckFromRemote(ack, ackBits)
@@ -214,17 +259,21 @@ func (s *Server) ListenLoop() {
 				case proto.MsgPing:
 					if len(inner) >= 9 {
 						clientTs := int64(binary.LittleEndian.Uint64(inner[1:9]))
+						peer.lastActive = time.Now()
+
 						pong := make([]byte, 1+8)
 						pong[0] = proto.MsgPong
 						binary.LittleEndian.PutUint64(pong[1:], uint64(clientTs))
 						seq := peer.txReliable.AddPending(pong)
 						ack2, ackbits2 := peer.rxReliable.BuildAckAndBits()
 						packetSeq2 := peer.txReliable.NextPacketSeq()
-						buf2 := &bytes.Buffer{}
+						buf2 := s.bufferPool.Get().(*bytes.Buffer)
+						buf2.Reset()
 						proto.WriteUDPHeader(buf2, packetSeq2, ack2, ackbits2)
 						proto.PackReliableEnvelope(buf2, seq, pong)
 						_, _ = s.conn.WriteToUDP(buf2.Bytes(), peer.addr)
 						peer.txReliable.UpdatePendingSent(seq)
+						s.bufferPool.Put(buf2)
 					}
 				default:
 					// 其他可靠消息按需扩展
@@ -265,7 +314,8 @@ func (s *Server) BroadcastLoop() {
 		s.logic.Tick(s.tick, inputs)
 
 		// 构建帧数据：输入帧 + 自定义快照（长度前缀 uint16）
-		payloadBuf := &bytes.Buffer{}
+		payloadBuf := s.bufferPool.Get().(*bytes.Buffer)
+		payloadBuf.Reset()
 		proto.WriteFramePacket(payloadBuf, s.tick, inputs)
 
 		if snap, err := s.logic.Snapshot(s.tick); err == nil && len(snap) > 0 {
@@ -280,15 +330,20 @@ func (s *Server) BroadcastLoop() {
 		}
 
 		payload := payloadBuf.Bytes()
+		payloadCopy := make([]byte, len(payload))
+		copy(payloadCopy, payload)
+		s.bufferPool.Put(payloadBuf)
 
 		s.room.mu.Lock()
 		for _, p := range s.room.players {
 			packetSeq := p.txReliable.NextPacketSeq()
 			ack, ackbits := p.rxReliable.BuildAckAndBits()
-			buf := &bytes.Buffer{}
+			buf := s.bufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
 			proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
-			buf.Write(payload)
+			buf.Write(payloadCopy)
 			_, _ = s.conn.WriteToUDP(buf.Bytes(), p.addr)
+			s.bufferPool.Put(buf)
 		}
 		s.room.mu.Unlock()
 
@@ -311,7 +366,8 @@ func (s *Server) ReliableRetransmitLoop() {
 			for _, pm := range pend {
 				ack, ackbits := p.rxReliable.BuildAckAndBits()
 				packetSeq := p.txReliable.NextPacketSeq()
-				buf := &bytes.Buffer{}
+				buf := s.bufferPool.Get().(*bytes.Buffer)
+				buf.Reset()
 				proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
 				proto.PackReliableEnvelope(buf, pm.Seq, pm.Payload)
 				_, err := s.conn.WriteToUDP(buf.Bytes(), p.addr)
@@ -321,10 +377,57 @@ func (s *Server) ReliableRetransmitLoop() {
 					p.txReliable.UpdatePendingSent(pm.Seq)
 					fmt.Printf("Server retransmit -> peer %d reliableSeq=%d packetSeq=%d\n", p.id, pm.Seq, packetSeq)
 				}
+				s.bufferPool.Put(buf)
 			}
 		}
 		s.room.mu.Unlock()
 	}
+}
+
+// CheckPlayerTimeout 检测玩家超时并清理（建议以 goroutine 调用）
+func (s *Server) CheckPlayerTimeout() {
+	ticker := time.NewTicker(5 * time.Second) // 每 5 秒检查一次
+	for range ticker.C {
+		now := time.Now()
+		var toRemove []int
+
+		s.room.mu.Lock()
+		for id, p := range s.room.players {
+			if now.Sub(p.lastActive) > s.playerTimeout {
+				toRemove = append(toRemove, id)
+			}
+		}
+		s.room.mu.Unlock()
+
+		// 清理超时玩家
+		for _, id := range toRemove {
+			s.removePlayer(id)
+		}
+	}
+}
+
+// removePlayer 移除玩家
+func (s *Server) removePlayer(id int) {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+
+	p, ok := s.room.players[id]
+	if !ok {
+		return
+	}
+
+	// 从地址映射中删除
+	if p.addr != nil {
+		delete(s.room.playersByAddr, p.addr.String())
+	}
+
+	// 从玩家列表中删除
+	delete(s.room.players, id)
+
+	// 调用游戏逻辑的 OnLeave
+	s.logic.OnLeave(uint16(id))
+
+	fmt.Printf("Server: removed timeout player id=%d\n", id)
 }
 
 // HandleJoinReliable 处理 join（会发送 JoinAck / PlayerList / Broadcast Joined）
@@ -340,11 +443,13 @@ func (s *Server) HandleJoinReliable(peer *ClientPeer, reliableSeq uint32, inner 
 	seq := peer.txReliable.AddPending(ackPayload)
 	ack, ackbits := peer.rxReliable.BuildAckAndBits()
 	packetSeq := peer.txReliable.NextPacketSeq()
-	buf := &bytes.Buffer{}
+	buf := s.bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
 	proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
 	proto.PackReliableEnvelope(buf, seq, ackPayload)
 	_, _ = s.conn.WriteToUDP(buf.Bytes(), peer.addr)
 	peer.txReliable.UpdatePendingSent(seq)
+	s.bufferPool.Put(buf)
 	fmt.Printf("Server sent JoinAck reliableSeq=%d packetSeq=%d to %d\n", seq, packetSeq, peer.id)
 
 	// 广播 PlayerJoined
@@ -359,13 +464,14 @@ func (s *Server) BroadcastPlayerJoined(newPlayerID int) {
 		seq := p.txReliable.AddPending(payload)
 		ack, ackbits := p.rxReliable.BuildAckAndBits()
 		packetSeq := p.txReliable.NextPacketSeq()
-		buf := &bytes.Buffer{}
+		buf := s.bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
 		proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
 		proto.PackReliableEnvelope(buf, seq, payload)
 		_, _ = s.conn.WriteToUDP(buf.Bytes(), p.addr)
 		p.txReliable.UpdatePendingSent(seq)
+		s.bufferPool.Put(buf)
 		fmt.Printf("Server broadcast PlayerJoined -> peer %d reliableSeq=%d packetSeq=%d\n", p.id, seq, packetSeq)
 	}
 	s.room.mu.Unlock()
 }
-
