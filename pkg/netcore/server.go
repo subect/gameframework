@@ -238,8 +238,8 @@ func (s *Server) ListenLoop() {
 				fmt.Printf("Server: suspicious future input tick=%d (serverTick=%d) from pid=%d\n", p.Tick, s.tick, p.PlayerID)
 				continue
 			}
+			// 存储输入到指定的 tick，在 BroadcastLoop 的 Tick 中统一处理
 			s.storeInput(p.Tick, p.PlayerID, p.Input)
-			s.logic.ApplyInput(p.PlayerID, p.Input)
 			continue
 		}
 		// else try reliable
@@ -285,8 +285,22 @@ func (s *Server) ListenLoop() {
 func (s *Server) BroadcastLoop() {
 	ticker := time.NewTicker(time.Duration(1000/s.tickHz) * time.Millisecond)
 	for range ticker.C {
+		// 检查是否有玩家
+		s.room.mu.Lock()
+		hasPlayers := len(s.room.players) > 0
+		s.room.mu.Unlock()
+
+		// 如果没有玩家，跳过
+		if !hasPlayers {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
 		maxRecv := s.findMaxReceivedTick()
-		if s.tick >= maxRecv+uint32(s.tickHz) {
+		// 如果有玩家但没有输入，也继续发送帧（使用 InputNone）
+		if maxRecv == 0 && s.tick == 0 {
+			// 第一个 tick，直接开始
+		} else if s.tick > 0 && s.tick >= maxRecv+uint32(s.tickHz) {
 			time.Sleep(1 * time.Millisecond)
 			continue
 		}
@@ -335,6 +349,9 @@ func (s *Server) BroadcastLoop() {
 
 		s.room.mu.Lock()
 		for _, p := range s.room.players {
+			// 发送帧数据时更新活跃时间（避免因没有输入而被超时移除）
+			p.lastActive = time.Now()
+
 			packetSeq := p.txReliable.NextPacketSeq()
 			ack, ackbits := p.rxReliable.BuildAckAndBits()
 			buf := s.bufferPool.Get().(*bytes.Buffer)
