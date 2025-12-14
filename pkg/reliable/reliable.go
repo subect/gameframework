@@ -14,7 +14,7 @@ func nowMs() int64 { return time.Now().UnixNano() / int64(time.Millisecond) }
 // SeqMoreRecent 处理 wrap-around 比较
 func SeqMoreRecent(s1, s2 uint32) bool { return int32(s1-s2) > 0 }
 
-// ReliableReceiver: 接收侧（记录远端 reliable seq 的收到情况，构造 ack/ackBits，去重）
+// ReliableReceiver 接收侧（记录远端 reliable seq 的收到情况，构造 ack/ackBits，去重）
 type ReliableReceiver struct {
 	mu           sync.Mutex
 	received     map[uint32]bool

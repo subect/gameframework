@@ -11,29 +11,21 @@ import (
 	"time"
 )
 
-// GameLogic 定义可插拔的游戏逻辑接口。
-// 由业务方实现，以便在网络层不变的情况下扩展帧格式/游戏玩法。
+// GameLogic 由业务方实现
 type GameLogic interface {
-	// OnJoin 在玩家加入时回调，可做初始化。
 	OnJoin(pid uint16)
-	// OnLeave 在玩家离开时回调（当前未调用，可预留）。
 	OnLeave(pid uint16)
-	// ApplyInput 在收到输入时调用，业务方可即时更新状态/缓存输入。
 	ApplyInput(pid uint16, input uint32)
-	// Tick 在每个广播 tick 调用，提供本 tick 聚合的输入。
 	Tick(tick uint32, inputs map[uint16]uint32)
-	// Snapshot 返回当前状态的二进制快照，服务器会附加到帧末尾。
-	// 注意返回的数据会以 uint16 长度前缀写入，长度超出 65535 将被丢弃并跳过本帧附加。
 	Snapshot(tick uint32) ([]byte, error)
-	// HandleReliableMessage 处理可靠消息。返回 true 表示消息已处理，false 表示未处理。
+	// HandleReliableMessage 处理可靠消息
 	// peerID: 发送消息的玩家ID（如果为0表示未知peer），addr: 发送消息的地址，msgType: 消息类型（第一个字节），payload: 消息内容（包含 msgType）
-	// 如果返回的 playerID > 0，表示需要注册该 playerID 的 peer
 	HandleReliableMessage(peerID uint16, addr *net.UDPAddr, msgType byte, payload []byte) (handled bool, playerID int)
 }
 
 // ClientPeer 保留 peer 状态
 type ClientPeer struct {
-	ID          int       // 玩家ID（供业务层访问）
+	ID          int // 玩家ID（供业务层访问）
 	Addr        *net.UDPAddr
 	rxReliable  *reliable.ReliableReceiver
 	txReliable  *reliable.ReliableSender
@@ -43,7 +35,6 @@ type ClientPeer struct {
 	inputWindow time.Time // 输入窗口开始时间
 }
 
-// Server 主体（可插拔游戏逻辑）
 type Server struct {
 	conn *net.UDPConn
 	room struct {
@@ -267,7 +258,7 @@ func (s *Server) ListenLoop() {
 			if !peer.rxReliable.AlreadyProcessed(rseq) {
 				peer.rxReliable.MarkProcessed(rseq)
 				msgType := inner[0]
-				
+
 				// Ping/Pong 是网络层基础功能，框架内部处理
 				if msgType == proto.MsgPing {
 					if len(inner) >= 9 {
