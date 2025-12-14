@@ -8,13 +8,10 @@ import (
 	"time"
 )
 
-// nowMs 返回毫秒时间
 func nowMs() int64 { return time.Now().UnixNano() / int64(time.Millisecond) }
 
-// SeqMoreRecent 处理 wrap-around 比较
 func SeqMoreRecent(s1, s2 uint32) bool { return int32(s1-s2) > 0 }
 
-// ReliableReceiver 接收侧（记录远端 reliable seq 的收到情况，构造 ack/ackBits，去重）
 type ReliableReceiver struct {
 	mu           sync.Mutex
 	received     map[uint32]bool
@@ -63,7 +60,6 @@ func (r *ReliableReceiver) BuildAckAndBits() (uint32, uint32) {
 	return ack, bits
 }
 
-// ReliableSender: 发送侧（管理 pending、分配 seq、重传）
 type pendingMsg struct {
 	Seq        uint32
 	Payload    []byte
@@ -148,7 +144,6 @@ func (s *ReliableSender) PendingCount() int {
 	return len(s.pending)
 }
 
-// Envelope helpers (for convenience in tests)
 func PackReliableEnvelope(buf *bytes.Buffer, seq uint32, payload []byte) {
 	binary.Write(buf, binary.LittleEndian, seq)
 	buf.Write(payload)
