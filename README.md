@@ -15,4 +15,17 @@
 - 自定义游戏逻辑接口
 - 高性能优化
 
+## 功能实现情况
+
+| 功能 | 实现情况 | 备注 |
+|------|---------|------|
+| Delay-based Lockstep | ✅ | 目前项目实现 |
+| Reliable UDP | ✅ | 工程级别基础 |
+| RTT adaptive delay | ✅ | 自动延迟计算 |
+| Prediction + Correction | ✅ | 客户端 |
+| Rollback + Re-simulate | ❌ | 高级特性 |
+| Deterministic simulation | ❌ | 高级特性 |
+| Frame interpolation | ❌ | 可选特性 |
+| Snapshot / delta sync | ❌ | 高级状态优化 |
+
 剩余功能逐步完善。
