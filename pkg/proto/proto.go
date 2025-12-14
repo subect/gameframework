@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"math"
 )
 
 const (
@@ -77,122 +76,6 @@ func ReadFramePacket(b []byte) (uint32, map[uint16]uint32, error) {
 		inputs[pid] = in
 	}
 	return tick, inputs, nil
-}
-
-type PlayerPos struct {
-	PID  uint16
-	X, Y float32
-}
-
-// ReadFramePacketWithPos 读取包含位置的帧数据
-func ReadFramePacketWithPos(b []byte) (uint32, map[uint16]uint32, []PlayerPos, error) {
-	tick, inputs, err := ReadFramePacket(b)
-	if err != nil {
-		return tick, inputs, nil, err
-	}
-
-	// 尝试读取位置数据
-	r := bytes.NewReader(b)
-	// 跳过已读的数据
-	var tempTick uint32
-	var tempCount uint8
-	binary.Read(r, binary.LittleEndian, &tempTick)
-	binary.Read(r, binary.LittleEndian, &tempCount)
-	for i := 0; i < int(tempCount); i++ {
-		var pid uint16
-		var in uint32
-		binary.Read(r, binary.LittleEndian, &pid)
-		binary.Read(r, binary.LittleEndian, &in)
-	}
-
-	var posCount uint8
-	if err := binary.Read(r, binary.LittleEndian, &posCount); err != nil {
-		return tick, inputs, nil, nil
-	}
-
-	positions := make([]PlayerPos, 0, posCount)
-	for i := 0; i < int(posCount); i++ {
-		var pos PlayerPos
-		if err := binary.Read(r, binary.LittleEndian, &pos.PID); err != nil {
-			return tick, inputs, positions, err
-		}
-		if err := binary.Read(r, binary.LittleEndian, &pos.X); err != nil {
-			return tick, inputs, positions, err
-		}
-		if err := binary.Read(r, binary.LittleEndian, &pos.Y); err != nil {
-			return tick, inputs, positions, err
-		}
-		positions = append(positions, pos)
-	}
-
-	return tick, inputs, positions, nil
-}
-
-func ReadFramePacketWithSnapshot(b []byte) (uint32, map[uint16]uint32, []byte, error) {
-	tick, inputs, err := ReadFramePacket(b)
-	if err != nil {
-		return tick, inputs, nil, err
-	}
-
-	r := bytes.NewReader(b)
-	var tempTick uint32
-	var tempCount uint8
-	binary.Read(r, binary.LittleEndian, &tempTick)
-	binary.Read(r, binary.LittleEndian, &tempCount)
-	for i := 0; i < int(tempCount); i++ {
-		var pid uint16
-		var in uint32
-		binary.Read(r, binary.LittleEndian, &pid)
-		binary.Read(r, binary.LittleEndian, &in)
-	}
-
-	var snapshotLen uint16
-	if err := binary.Read(r, binary.LittleEndian, &snapshotLen); err != nil {
-		return tick, inputs, nil, nil
-	}
-
-	if snapshotLen == 0 {
-		return tick, inputs, nil, nil
-	}
-
-	snapshot := make([]byte, snapshotLen)
-	if n, err := r.Read(snapshot); err != nil || n != int(snapshotLen) {
-		return tick, inputs, nil, fmt.Errorf("failed to read snapshot: %v", err)
-	}
-
-	return tick, inputs, snapshot, nil
-}
-
-func ReadSnapshotPositions(snapshot []byte) ([]PlayerPos, error) {
-	if len(snapshot) == 0 {
-		return nil, nil
-	}
-
-	r := bytes.NewReader(snapshot)
-	var count uint8
-	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, err
-	}
-
-	positions := make([]PlayerPos, 0, count)
-	for i := 0; i < int(count); i++ {
-		var pos PlayerPos
-		if err := binary.Read(r, binary.LittleEndian, &pos.PID); err != nil {
-			return positions, err
-		}
-		var xBits, yBits uint32
-		if err := binary.Read(r, binary.LittleEndian, &xBits); err != nil {
-			return positions, err
-		}
-		if err := binary.Read(r, binary.LittleEndian, &yBits); err != nil {
-			return positions, err
-		}
-		pos.X = math.Float32frombits(xBits)
-		pos.Y = math.Float32frombits(yBits)
-		positions = append(positions, pos)
-	}
-
-	return positions, nil
 }
 
 func WriteUDPHeader(buf *bytes.Buffer, packetSeq, ack, ackBits uint32) {

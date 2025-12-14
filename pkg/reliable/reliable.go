@@ -1,9 +1,6 @@
 package reliable
 
 import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -137,21 +134,4 @@ func (s *ReliableSender) NextPacketSeq() uint32 {
 	v := s.nextPacketSeq
 	s.nextPacketSeq++
 	return v
-}
-func (s *ReliableSender) PendingCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.pending)
-}
-
-func PackReliableEnvelope(buf *bytes.Buffer, seq uint32, payload []byte) {
-	binary.Write(buf, binary.LittleEndian, seq)
-	buf.Write(payload)
-}
-func UnpackReliableEnvelope(b []byte) (uint32, []byte, error) {
-	if len(b) < 4 {
-		return 0, nil, fmt.Errorf("too small")
-	}
-	seq := binary.LittleEndian.Uint32(b[:4])
-	return seq, b[4:], nil
 }
