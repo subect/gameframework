@@ -25,15 +25,19 @@ type GameLogic interface {
 	// Snapshot 返回当前状态的二进制快照，服务器会附加到帧末尾。
 	// 注意返回的数据会以 uint16 长度前缀写入，长度超出 65535 将被丢弃并跳过本帧附加。
 	Snapshot(tick uint32) ([]byte, error)
+	// HandleReliableMessage 处理可靠消息。返回 true 表示消息已处理，false 表示未处理。
+	// peerID: 发送消息的玩家ID（如果为0表示未知peer），addr: 发送消息的地址，msgType: 消息类型（第一个字节），payload: 消息内容（包含 msgType）
+	// 如果返回的 playerID > 0，表示需要注册该 playerID 的 peer
+	HandleReliableMessage(peerID uint16, addr *net.UDPAddr, msgType byte, payload []byte) (handled bool, playerID int)
 }
 
 // ClientPeer 保留 peer 状态
 type ClientPeer struct {
-	id          int
-	addr        *net.UDPAddr
+	ID          int       // 玩家ID（供业务层访问）
+	Addr        *net.UDPAddr
 	rxReliable  *reliable.ReliableReceiver
 	txReliable  *reliable.ReliableSender
-	joined      bool
+	Joined      bool      // 是否已加入（供业务层访问）
 	lastActive  time.Time // 最后活跃时间，用于超时检测
 	inputCount  int       // 输入计数（用于限流）
 	inputWindow time.Time // 输入窗口开始时间
@@ -105,20 +109,20 @@ func (s *Server) registerPeer(id int, addr *net.UDPAddr) *ClientPeer {
 
 	if p, ok := s.room.players[id]; ok {
 		// 更新地址映射
-		if p.addr != nil {
-			delete(s.room.playersByAddr, p.addr.String())
+		if p.Addr != nil {
+			delete(s.room.playersByAddr, p.Addr.String())
 		}
-		p.addr = addr
+		p.Addr = addr
 		s.room.playersByAddr[addrKey] = p
 		p.lastActive = time.Now()
 		return p
 	}
 	p := &ClientPeer{
-		id:          id,
-		addr:        addr,
+		ID:          id,
+		Addr:        addr,
 		rxReliable:  reliable.NewReliableReceiver(),
 		txReliable:  reliable.NewReliableSender(),
-		joined:      false,
+		Joined:      false,
 		lastActive:  time.Now(),
 		inputWindow: time.Now(),
 	}
@@ -194,16 +198,29 @@ func (s *Server) ListenLoop() {
 		}
 		peer := s.findPeerByAddr(raddr)
 		if peer == nil {
-			// try reliable join
-			if rseq, inner, err := proto.UnpackReliableEnvelope(payload); err == nil {
-				if len(inner) >= 2 && inner[0] == proto.MsgJoinRoom {
-					playerID := int(inner[1])
-					peer = s.registerPeer(playerID, raddr)
-					peer.rxReliable.MarkReceived(rseq)
-					if !peer.rxReliable.AlreadyProcessed(rseq) {
-						peer.rxReliable.MarkProcessed(rseq)
-						s.logic.OnJoin(uint16(playerID))
-						go s.HandleJoinReliable(peer, rseq, inner)
+			// 未知 peer，尝试从可靠消息中获取玩家ID（由业务层处理）
+			if rseq, inner, err := proto.UnpackReliableEnvelope(payload); err == nil && len(inner) > 0 {
+				// 先尝试让业务层处理（可能会返回需要注册的 playerID）
+				handled, playerID := s.logic.HandleReliableMessage(0, raddr, inner[0], inner)
+				if handled {
+					// 如果返回了 playerID，注册 peer 并再次调用 HandleReliableMessage 处理加入逻辑
+					if playerID > 0 {
+						peer = s.registerPeer(playerID, raddr)
+						peer.rxReliable.MarkReceived(rseq)
+						if !peer.rxReliable.AlreadyProcessed(rseq) {
+							peer.rxReliable.MarkProcessed(rseq)
+							// 注册 peer 后，再次调用 HandleReliableMessage 处理加入逻辑
+							s.logic.HandleReliableMessage(uint16(playerID), raddr, inner[0], inner)
+						}
+					} else {
+						// 业务层已处理但不需要注册，重新查找 peer（可能已注册）
+						peer = s.findPeerByAddr(raddr)
+						if peer != nil {
+							peer.rxReliable.MarkReceived(rseq)
+							if !peer.rxReliable.AlreadyProcessed(rseq) {
+								peer.rxReliable.MarkProcessed(rseq)
+							}
+						}
 					}
 					continue
 				}
@@ -214,7 +231,6 @@ func (s *Server) ListenLoop() {
 				peer = s.registerPeer(playerID, raddr)
 				peer.lastActive = time.Now() // 更新活跃时间
 				s.storeInput(p.Tick, p.PlayerID, p.Input)
-				s.logic.ApplyInput(p.PlayerID, p.Input)
 				continue
 			}
 			continue
@@ -226,7 +242,7 @@ func (s *Server) ListenLoop() {
 		if peer.txReliable != nil {
 			cleared := peer.txReliable.ProcessAckFromRemote(ack, ackBits)
 			if len(cleared) > 0 {
-				fmt.Printf("Server: cleared pending for peer %d seqs=%v\n", peer.id, cleared)
+				fmt.Printf("Server: cleared pending for peer %d seqs=%v\n", peer.ID, cleared)
 			}
 		}
 		// parse input first
@@ -250,10 +266,10 @@ func (s *Server) ListenLoop() {
 			peer.rxReliable.MarkReceived(rseq)
 			if !peer.rxReliable.AlreadyProcessed(rseq) {
 				peer.rxReliable.MarkProcessed(rseq)
-				switch inner[0] {
-				case proto.MsgJoinRoom:
-					go s.HandleJoinReliable(peer, rseq, inner)
-				case proto.MsgPing:
+				msgType := inner[0]
+				
+				// Ping/Pong 是网络层基础功能，框架内部处理
+				if msgType == proto.MsgPing {
 					if len(inner) >= 9 {
 						clientTs := int64(binary.LittleEndian.Uint64(inner[1:9]))
 						peer.lastActive = time.Now()
@@ -261,19 +277,11 @@ func (s *Server) ListenLoop() {
 						pong := make([]byte, 1+8)
 						pong[0] = proto.MsgPong
 						binary.LittleEndian.PutUint64(pong[1:], uint64(clientTs))
-						seq := peer.txReliable.AddPending(pong)
-						ack2, ackbits2 := peer.rxReliable.BuildAckAndBits()
-						packetSeq2 := peer.txReliable.NextPacketSeq()
-						buf2 := s.bufferPool.Get().(*bytes.Buffer)
-						buf2.Reset()
-						proto.WriteUDPHeader(buf2, packetSeq2, ack2, ackbits2)
-						proto.PackReliableEnvelope(buf2, seq, pong)
-						_, _ = s.conn.WriteToUDP(buf2.Bytes(), peer.addr)
-						peer.txReliable.UpdatePendingSent(seq)
-						s.bufferPool.Put(buf2)
+						s.SendReliableToPeer(peer, pong)
 					}
-				default:
-					// 其他可靠消息按需扩展
+				} else {
+					// 其他可靠消息交给业务层处理
+					s.logic.HandleReliableMessage(uint16(peer.ID), peer.Addr, msgType, inner)
 				}
 			}
 			continue
@@ -358,7 +366,7 @@ func (s *Server) BroadcastLoop() {
 			buf.Reset()
 			proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
 			buf.Write(payloadCopy)
-			_, _ = s.conn.WriteToUDP(buf.Bytes(), p.addr)
+			_, _ = s.conn.WriteToUDP(buf.Bytes(), p.Addr)
 			s.bufferPool.Put(buf)
 		}
 		s.room.mu.Unlock()
@@ -386,12 +394,12 @@ func (s *Server) ReliableRetransmitLoop() {
 				buf.Reset()
 				proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
 				proto.PackReliableEnvelope(buf, pm.Seq, pm.Payload)
-				_, err := s.conn.WriteToUDP(buf.Bytes(), p.addr)
+				_, err := s.conn.WriteToUDP(buf.Bytes(), p.Addr)
 				if err != nil {
 					fmt.Println("Server retransmit err:", err)
 				} else {
 					p.txReliable.UpdatePendingSent(pm.Seq)
-					fmt.Printf("Server retransmit -> peer %d reliableSeq=%d packetSeq=%d\n", p.id, pm.Seq, packetSeq)
+					fmt.Printf("Server retransmit -> peer %d reliableSeq=%d packetSeq=%d\n", p.ID, pm.Seq, packetSeq)
 				}
 				s.bufferPool.Put(buf)
 			}
@@ -433,8 +441,8 @@ func (s *Server) removePlayer(id int) {
 	}
 
 	// 从地址映射中删除
-	if p.addr != nil {
-		delete(s.room.playersByAddr, p.addr.String())
+	if p.Addr != nil {
+		delete(s.room.playersByAddr, p.Addr.String())
 	}
 
 	// 从玩家列表中删除
@@ -446,48 +454,48 @@ func (s *Server) removePlayer(id int) {
 	fmt.Printf("Server: removed timeout player id=%d\n", id)
 }
 
-// HandleJoinReliable 处理 join（会发送 JoinAck / PlayerList / Broadcast Joined）
-func (s *Server) HandleJoinReliable(peer *ClientPeer, reliableSeq uint32, inner []byte) {
-	if len(inner) < 2 {
-		return
-	}
-	peer.joined = true
-	// 初始化玩家
-	s.logic.OnJoin(uint16(peer.id))
-
-	ackPayload := []byte{proto.MsgJoinAck, byte(peer.id)}
-	seq := peer.txReliable.AddPending(ackPayload)
+// SendReliableToPeer 向指定 peer 发送可靠消息（供业务层使用）
+func (s *Server) SendReliableToPeer(peer *ClientPeer, payload []byte) {
+	seq := peer.txReliable.AddPending(payload)
 	ack, ackbits := peer.rxReliable.BuildAckAndBits()
 	packetSeq := peer.txReliable.NextPacketSeq()
 	buf := s.bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
-	proto.PackReliableEnvelope(buf, seq, ackPayload)
-	_, _ = s.conn.WriteToUDP(buf.Bytes(), peer.addr)
+	proto.PackReliableEnvelope(buf, seq, payload)
+	_, _ = s.conn.WriteToUDP(buf.Bytes(), peer.Addr)
 	peer.txReliable.UpdatePendingSent(seq)
 	s.bufferPool.Put(buf)
-	fmt.Printf("Server sent JoinAck reliableSeq=%d packetSeq=%d to %d\n", seq, packetSeq, peer.id)
-
-	// 广播 PlayerJoined
-	s.BroadcastPlayerJoined(peer.id)
 }
 
-// BroadcastPlayerJoined 广播新玩家加入
-func (s *Server) BroadcastPlayerJoined(newPlayerID int) {
-	payload := proto.BuildPlayerJoined(newPlayerID)
+// SendReliableToAll 向所有 peer 广播可靠消息（供业务层使用）
+func (s *Server) SendReliableToAll(payload []byte) {
 	s.room.mu.Lock()
 	for _, p := range s.room.players {
-		seq := p.txReliable.AddPending(payload)
-		ack, ackbits := p.rxReliable.BuildAckAndBits()
-		packetSeq := p.txReliable.NextPacketSeq()
-		buf := s.bufferPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		proto.WriteUDPHeader(buf, packetSeq, ack, ackbits)
-		proto.PackReliableEnvelope(buf, seq, payload)
-		_, _ = s.conn.WriteToUDP(buf.Bytes(), p.addr)
-		p.txReliable.UpdatePendingSent(seq)
-		s.bufferPool.Put(buf)
-		fmt.Printf("Server broadcast PlayerJoined -> peer %d reliableSeq=%d packetSeq=%d\n", p.id, seq, packetSeq)
+		s.SendReliableToPeer(p, payload)
 	}
 	s.room.mu.Unlock()
+}
+
+// GetPeer 获取指定 ID 的 peer（供业务层使用）
+func (s *Server) GetPeer(pid uint16) *ClientPeer {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+	return s.room.players[int(pid)]
+}
+
+// GetAllPeers 获取所有 peer（供业务层使用）
+func (s *Server) GetAllPeers() []*ClientPeer {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+	peers := make([]*ClientPeer, 0, len(s.room.players))
+	for _, p := range s.room.players {
+		peers = append(peers, p)
+	}
+	return peers
+}
+
+// RegisterPeer 注册新 peer（供业务层使用，例如从可靠消息中获取玩家ID后注册）
+func (s *Server) RegisterPeer(id int, addr *net.UDPAddr) *ClientPeer {
+	return s.registerPeer(id, addr)
 }

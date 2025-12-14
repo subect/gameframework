@@ -4,17 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
-// 公共消息类型（可扩展）
+// 网络层基础消息类型
 const (
-	MsgJoinRoom     = 1
-	MsgJoinAck      = 2
-	MsgPlayerList   = 3
-	MsgPlayerJoined = 4
-
-	MsgPing = 10
-	MsgPong = 11
+	MsgPing = 1
+	MsgPong = 2
 )
 
 // InputPacket 表示客户端上报的输入（序列化格式）
@@ -138,6 +134,81 @@ func ReadFramePacketWithPos(b []byte) (uint32, map[uint16]uint32, []PlayerPos, e
 	return tick, inputs, positions, nil
 }
 
+// ReadFramePacketWithSnapshot 读取包含快照的帧数据
+// 格式：FramePacket + uint16(snapshotLen) + snapshotData
+func ReadFramePacketWithSnapshot(b []byte) (uint32, map[uint16]uint32, []byte, error) {
+	tick, inputs, err := ReadFramePacket(b)
+	if err != nil {
+		return tick, inputs, nil, err
+	}
+
+	// 计算已读的字节数
+	r := bytes.NewReader(b)
+	var tempTick uint32
+	var tempCount uint8
+	binary.Read(r, binary.LittleEndian, &tempTick)
+	binary.Read(r, binary.LittleEndian, &tempCount)
+	for i := 0; i < int(tempCount); i++ {
+		var pid uint16
+		var in uint32
+		binary.Read(r, binary.LittleEndian, &pid)
+		binary.Read(r, binary.LittleEndian, &in)
+	}
+
+	// 读取快照长度前缀
+	var snapshotLen uint16
+	if err := binary.Read(r, binary.LittleEndian, &snapshotLen); err != nil {
+		// 没有快照数据，返回空
+		return tick, inputs, nil, nil
+	}
+
+	if snapshotLen == 0 {
+		return tick, inputs, nil, nil
+	}
+
+	// 读取快照数据
+	snapshot := make([]byte, snapshotLen)
+	if n, err := r.Read(snapshot); err != nil || n != int(snapshotLen) {
+		return tick, inputs, nil, fmt.Errorf("failed to read snapshot: %v", err)
+	}
+
+	return tick, inputs, snapshot, nil
+}
+
+// ReadSnapshotPositions 从快照数据中解析玩家位置
+// 格式：uint8(count) + [uint16(pid) + float32(x) + float32(y)] * count
+func ReadSnapshotPositions(snapshot []byte) ([]PlayerPos, error) {
+	if len(snapshot) == 0 {
+		return nil, nil
+	}
+
+	r := bytes.NewReader(snapshot)
+	var count uint8
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, err
+	}
+
+	positions := make([]PlayerPos, 0, count)
+	for i := 0; i < int(count); i++ {
+		var pos PlayerPos
+		if err := binary.Read(r, binary.LittleEndian, &pos.PID); err != nil {
+			return positions, err
+		}
+		var xBits, yBits uint32
+		if err := binary.Read(r, binary.LittleEndian, &xBits); err != nil {
+			return positions, err
+		}
+		if err := binary.Read(r, binary.LittleEndian, &yBits); err != nil {
+			return positions, err
+		}
+		pos.X = math.Float32frombits(xBits)
+		pos.Y = math.Float32frombits(yBits)
+		positions = append(positions, pos)
+	}
+
+	return positions, nil
+}
+
 // UDP header: packetSeq:uint32 | ack:uint32 | ackBits:uint32 | payload...
 func WriteUDPHeader(buf *bytes.Buffer, packetSeq, ack, ackBits uint32) {
 	binary.Write(buf, binary.LittleEndian, packetSeq)
@@ -167,31 +238,4 @@ func UnpackReliableEnvelope(b []byte) (uint32, []byte, error) {
 	}
 	seq := binary.LittleEndian.Uint32(b[0:4])
 	return seq, b[4:], nil
-}
-
-// helper message builders/parsers (Join/PlayerList)
-func BuildPlayerList(ids []int) []byte {
-	buf := []byte{MsgPlayerList, byte(len(ids))}
-	for _, id := range ids {
-		buf = append(buf, byte(id))
-	}
-	return buf
-}
-func ParsePlayerList(b []byte) []int {
-	if len(b) < 2 {
-		return []int{}
-	}
-	n := int(b[1])
-	ids := make([]int, 0, n)
-	for i := 0; i < n && 2+i < len(b); i++ {
-		ids = append(ids, int(b[2+i]))
-	}
-	return ids
-}
-func BuildPlayerJoined(id int) []byte { return []byte{MsgPlayerJoined, byte(id)} }
-func ParsePlayerJoined(b []byte) int {
-	if len(b) < 2 {
-		return -1
-	}
-	return int(b[1])
 }
