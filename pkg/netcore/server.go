@@ -53,6 +53,69 @@ type Server struct {
 	bufferPool     sync.Pool
 }
 
+// ServerConfig defines high-level configuration for creating a Server.
+// This is intended as a more extensible alternative to NewServer for
+// real projects, while keeping NewServer for backward compatibility.
+type ServerConfig struct {
+	ListenAddr string
+	TickHz     int
+
+	// Optional limits / timeouts. If zero, sensible defaults are used.
+	PlayerTimeout  time.Duration
+	MaxInputPerSec int
+}
+
+// NewServerWithConfig creates a new Server using ServerConfig.
+// Prefer this over NewServer in new projects.
+func NewServerWithConfig(cfg ServerConfig, logic GameLogic) (*Server, error) {
+	if logic == nil {
+		return nil, fmt.Errorf("logic is nil")
+	}
+	if cfg.ListenAddr == "" {
+		return nil, fmt.Errorf("ListenAddr is empty")
+	}
+	if cfg.TickHz <= 0 {
+		return nil, fmt.Errorf("TickHz must be > 0")
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	playerTimeout := cfg.PlayerTimeout
+	if playerTimeout == 0 {
+		playerTimeout = 30 * time.Second
+	}
+	maxInputPerSec := cfg.MaxInputPerSec
+	if maxInputPerSec == 0 {
+		maxInputPerSec = 100
+	}
+
+	s := &Server{
+		conn:           conn,
+		inputs:         make(map[uint32]map[uint16]uint32),
+		tickHz:         cfg.TickHz,
+		logic:          logic,
+		playerTimeout:  playerTimeout,
+		maxInputPerSec: maxInputPerSec,
+	}
+	s.room.players = make(map[int]*ClientPeer)
+	s.room.playersByAddr = make(map[string]*ClientPeer)
+
+	s.bufferPool = sync.Pool{
+		New: func() interface{} {
+			return &bytes.Buffer{}
+		},
+	}
+
+	return s, nil
+}
+
 func NewServer(listen string, tickHz int, logic GameLogic) (*Server, error) {
 	if logic == nil {
 		return nil, fmt.Errorf("logic is nil")
@@ -83,6 +146,24 @@ func NewServer(listen string, tickHz int, logic GameLogic) (*Server, error) {
 	}
 
 	return s, nil
+}
+
+// Start launches the main server loops (read, broadcast, retransmit, timeout).
+// It is typically called once after creating the server.
+func (s *Server) Start() {
+	go s.ListenLoop()
+	go s.BroadcastLoop()
+	go s.ReliableRetransmitLoop()
+	go s.CheckPlayerTimeout()
+}
+
+// Close closes the underlying UDP connection.
+// Note: background goroutines will eventually exit once they observe the error.
+func (s *Server) Close() error {
+	if s.conn != nil {
+		return s.conn.Close()
+	}
+	return nil
 }
 
 func (s *Server) registerPeer(id int, addr *net.UDPAddr) *ClientPeer {
